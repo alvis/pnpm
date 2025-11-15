@@ -1204,3 +1204,202 @@ node_modules/
 - `pkg-manager/hoist/src/index.ts:294-302` - Location assignment
 - `config/config/src/index.ts:169-190` - Hoisting defaults
 - `config/config/src/index.ts:509-529` - shamefully-hoist handling
+
+---
+
+## How Packages Actually Resolve Their Peer Dependencies
+
+### The Critical Question
+
+If `your-package` is at `node_modules/your-package/` and has a peer dependency on `react`, but `react` is only in `.pnpm/node_modules/` (private hoisting), **how does `your-package` actually find `react`?**
+
+### The Answer: Virtual Store Symlink Structure
+
+**Location:** `deps/graph-builder/src/lockfileToDepGraph.ts:29-48, 201-202`
+
+pnpm uses a clever symlink structure where **each package with peers gets its own dedicated directory in the virtual store**.
+
+#### The Virtual Store Directory Structure
+
+**Directory naming (packages/dependency-path/src/index.ts:172-183):**
+
+```typescript
+export function depPathToFilename(depPath: string, maxLengthWithoutHash: number): string {
+  let filename = depPathToFilenameUnescaped(depPath).replace(/[\\/:*?"<>|#]/g, '+')
+  if (filename.includes('(')) {
+    filename = filename
+      .replace(/\)$/, '')
+      .replace(/\)\(|\(|\)/g, '_')  // Convert (ajv@4.10.4) to _ajv@4.10.4
+  }
+  return filename
+}
+```
+
+**Dependency path format:**
+- Without peers: `/ajv-keywords@1.5.0`
+- With peers: `/ajv-keywords@1.5.0(ajv@4.10.4)`
+
+**Filesystem directory:**
+- Without peers: `.pnpm/ajv-keywords@1.5.0/node_modules/`
+- With peers: `.pnpm/ajv-keywords@1.5.0_ajv@4.10.4/node_modules/`
+
+#### The Actual On-Disk Structure
+
+When you install `ajv-keywords` (which has peer: `ajv`):
+
+```
+node_modules/
+├── ajv-keywords/                    → symlink to .pnpm/ajv-keywords@1.5.0_ajv@4.10.4/node_modules/ajv-keywords/
+└── .pnpm/
+    ├── ajv-keywords@1.5.0_ajv@4.10.4/   ← Unique directory for this package+peer combination
+    │   └── node_modules/
+    │       ├── ajv-keywords/             ← The actual package content
+    │       └── ajv/                      → symlink to .pnpm/ajv@4.10.4/node_modules/ajv/
+    │
+    ├── ajv@4.10.4/
+    │   └── node_modules/
+    │       └── ajv/                      ← The actual ajv package
+    │
+    └── node_modules/                     ← Private hoisted (if hoist-pattern matches)
+        ├── ajv/                          → symlink to .pnpm/ajv@4.10.4/node_modules/ajv/
+        └── ajv-keywords/                 → symlink to .pnpm/ajv-keywords@1.5.0_ajv@4.10.4/node_modules/ajv-keywords/
+```
+
+#### How Resolution Works
+
+**Step-by-step resolution of `require('ajv')` from within `ajv-keywords`:**
+
+1. **User code:** `require('ajv-keywords')` from your application
+2. **Node.js resolves:** `node_modules/ajv-keywords/` → **symlink** → `.pnpm/ajv-keywords@1.5.0_ajv@4.10.4/node_modules/ajv-keywords/`
+3. **Inside ajv-keywords:** `require('ajv')`
+4. **Node.js walks up:** From `.pnpm/ajv-keywords@1.5.0_ajv@4.10.4/node_modules/ajv-keywords/`
+5. **Finds:** `.pnpm/ajv-keywords@1.5.0_ajv@4.10.4/node_modules/ajv/` ✅
+6. **Resolves symlink:** → `.pnpm/ajv@4.10.4/node_modules/ajv/`
+7. **Success!** `ajv-keywords` can access its peer dependency
+
+**The magic:** The peer dependency `ajv` is placed **in the same `node_modules/` directory** as the package that needs it, within the virtual store.
+
+#### The DependenciesGraphNode Structure
+
+**Location:** `deps/graph-builder/src/lockfileToDepGraph.ts:29-48`
+
+```typescript
+export interface DependenciesGraphNode {
+  modules: string                    // .pnpm/{depPath}/node_modules/
+  dir: string                        // .pnpm/{depPath}/node_modules/{pkgName}/
+  children: Record<string, string>   // Map of alias → directory path
+  // Peers are added to children just like regular dependencies!
+}
+```
+
+**Example node for `ajv-keywords`:**
+
+```typescript
+{
+  modules: '.pnpm/ajv-keywords@1.5.0_ajv@4.10.4/node_modules',
+  dir: '.pnpm/ajv-keywords@1.5.0_ajv@4.10.4/node_modules/ajv-keywords',
+  children: {
+    'ajv': '.pnpm/ajv@4.10.4/node_modules/ajv'  ← Peer dependency added here!
+  }
+}
+```
+
+#### Different Peer Combinations Get Different Directories
+
+**This is why the peer hash is in the directory name:**
+
+```
+.pnpm/
+├── ajv-keywords@1.5.0_ajv@4.10.4/   ← Used when paired with ajv@4.10.4
+│   └── node_modules/
+│       ├── ajv-keywords/
+│       └── ajv/                     → points to ajv@4.10.4
+│
+└── ajv-keywords@1.5.0_ajv@5.0.0/    ← Used when paired with ajv@5.0.0
+    └── node_modules/
+        ├── ajv-keywords/
+        └── ajv/                     → points to ajv@5.0.0
+```
+
+This allows **different packages to use different versions of the same peer**, maintaining strict isolation while sharing disk space through symlinks.
+
+#### Why Public Hoisting Is Optional
+
+**With this structure, packages can resolve peers WITHOUT public hoisting:**
+
+- Peer is in `.pnpm/{package}_{peers}/node_modules/peer/` ✅ Found via Node.js resolution
+- Public hoisting just provides an ADDITIONAL location at `node_modules/peer/` for convenience
+- Some tools expect packages at root level (legacy compatibility, IDE auto-discovery, etc.)
+
+**When you DO need public hoisting:**
+
+1. **Direct access:** Your application code does `require('react')` but didn't declare react as a dependency
+2. **Legacy tooling:** Build tools that scan `node_modules/` at root level
+3. **IDE support:** Some IDEs only discover packages at root level
+4. **Type definitions:** TypeScript resolution in some configurations
+
+**When you DON'T need public hoisting:**
+
+1. **All access is via declared dependencies:** Everything imports through packages that properly declare dependencies
+2. **Modern tools:** Build tools that follow Node.js resolution algorithm
+3. **You want strict isolation:** Prevent accidental access to undeclared dependencies
+
+### Real-World Example Revisited
+
+**Scenario:** Install `ajv-keywords@1.5.0` (peer: `ajv@^4.0.0`)
+
+**Without public-hoist-pattern (default):**
+
+```
+node_modules/
+├── ajv-keywords/        → symlink → .pnpm/ajv-keywords@1.5.0_ajv@4.10.4/node_modules/ajv-keywords/
+└── .pnpm/
+    ├── ajv-keywords@1.5.0_ajv@4.10.4/
+    │   └── node_modules/
+    │       ├── ajv-keywords/    ← Actual content
+    │       └── ajv/             → symlink → .pnpm/ajv@4.10.4/node_modules/ajv/
+    │
+    ├── ajv@4.10.4/
+    │   └── node_modules/
+    │       └── ajv/             ← Actual content
+    │
+    └── node_modules/
+        ├── ajv/                 → symlink → .pnpm/ajv@4.10.4/node_modules/ajv/
+        └── ajv-keywords/        → symlink → .pnpm/ajv-keywords@1.5.0_ajv@4.10.4/node_modules/ajv-keywords/
+```
+
+**Resolution:**
+- `require('ajv-keywords')` from your app → ✅ Works (root symlink)
+- `require('ajv')` from ajv-keywords → ✅ Works (virtual store node_modules)
+- `require('ajv')` from your app → ❌ Fails (not at root, unless you declared it)
+
+**With public-hoist-pattern=['ajv']:**
+
+```
+node_modules/
+├── ajv/                 → symlink → .pnpm/ajv@4.10.4/node_modules/ajv/  ← NOW AT ROOT
+├── ajv-keywords/        → symlink → .pnpm/ajv-keywords@1.5.0_ajv@4.10.4/node_modules/ajv-keywords/
+└── .pnpm/ (same as above)
+```
+
+**Resolution:**
+- All of the above → ✅ Works
+- `require('ajv')` from your app → ✅ NOW WORKS (root symlink exists)
+
+### Summary
+
+**The core mechanism:**
+1. **Dependency paths include peer information:** `/pkg@1.0.0(peer@2.0.0)`
+2. **Converted to filesystem names:** `.pnpm/pkg@1.0.0_peer@2.0.0/`
+3. **Each combination gets its own directory** with its own `node_modules/`
+4. **Peers are symlinked into that `node_modules/`** alongside the package
+5. **Node.js resolution finds them automatically** - no special logic needed
+6. **Public hoisting is purely for root-level access** - not required for resolution
+
+**Key insight:** pnpm's virtual store structure means **packages ALWAYS have access to their peers**, regardless of hoisting configuration. Public hoisting is only about whether YOUR application code can access them at root level.
+
+**Key Files:**
+- `packages/dependency-path/src/index.ts:172-216` - Peer path encoding
+- `deps/graph-builder/src/lockfileToDepGraph.ts:29-48` - DependenciesGraphNode with children
+- `deps/graph-builder/src/lockfileToDepGraph.ts:201-202` - Virtual store directory creation
+- `deps/graph-builder/src/lockfileToDepGraph.ts:283-308` - Children path resolution
