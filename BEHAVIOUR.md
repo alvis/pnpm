@@ -879,4 +879,328 @@ Can frozen install be used?
 - `pkg-manager/core/src/install/extendInstallOptions.ts:188` - autoInstallPeers default
 - `pkg-manager/core/src/install/index.ts:1091-1096` - forceFullResolution logic
 - `lockfile/settings-checker/src/getOutdatedLockfileSetting.ts:39-69` - Outdated setting checks
-- `config/config/src/index.ts:136` - auto-install-peers config
+- `config/config/src/index.js:136` - auto-install-peers config
+
+---
+
+## Peer Dependency Hoisting Levels
+
+### The Problem: Peers of Peers Not Hoisted to Expected Level
+
+A common confusion is understanding the difference between:
+1. **Whether** peers of peers are resolved (covered above)
+2. **Where** peers of peers are placed in the node_modules tree
+
+The `hoistPeers` function name is misleading - it determines **WHICH VERSION** to install, **NOT WHERE** to place the dependency.
+
+### How Hoisting Location Actually Works
+
+**Location:** `pkg-manager/resolve-dependencies/src/hoistPeers.ts:6-44`
+
+The `hoistPeers()` function implements a **version selection algorithm**, not a location algorithm:
+
+```typescript
+export function hoistPeers(opts, missingRequiredPeers) {
+  // TIER 1: Check workspace root dependencies
+  // TIER 2: Check allPreferredVersions (highest version satisfying range)
+  // TIER 3: Use peer's range if autoInstallPeers enabled
+
+  // Returns: Record<string, string> - package names to version specs
+  // Does NOT determine placement in node_modules!
+}
+```
+
+The actual **location decision** happens in the **hoisting graph algorithm**.
+
+### The Two-Level Hoisting System
+
+**Location:** `pkg-manager/hoist/src/index.ts:127-138, 294-302`
+
+pnpm has two hoisting levels:
+
+| Level | Location | Controlled By | Default |
+|-------|----------|---------------|---------|
+| **Private Hoisting** | `.pnpm/node_modules/` | `hoist-pattern` | `['*']` (all packages) |
+| **Public Hoisting** | `node_modules/` (root) | `public-hoist-pattern` | `[]` (none) |
+
+**Decision tree:**
+
+```typescript
+// pkg-manager/hoist/src/index.ts:127-138
+function createGetAliasHoistType(publicHoistPattern, privateHoistPattern) {
+  const publicMatcher = createMatcher(publicHoistPattern)
+  const privateMatcher = createMatcher(privateHoistPattern)
+
+  return (alias: string) => {
+    if (publicMatcher(alias)) return 'public'    // → node_modules/
+    if (privateMatcher(alias)) return 'private'  // → .pnpm/node_modules/
+    return false                                 // → no hoisting
+  }
+}
+```
+
+**Placement logic:**
+
+```typescript
+// Lines 294-302
+const targetDir = hoistType === 'public'
+  ? opts.publicHoistedModulesDir     // node_modules/
+  : opts.privateHoistedModulesDir    // .pnpm/node_modules/
+
+const dest = path.join(targetDir, pkgAlias)
+await symlink(depLocation, dest)
+```
+
+### Why Peers of Peers May Not Be at Root Level
+
+**Peers of peers are treated like any other dependency** - they follow the same hoisting rules:
+
+1. **Default behavior:** Only private hoisting (`.pnpm/node_modules/`)
+2. **They won't appear at root** unless they match `public-hoist-pattern`
+3. **Pattern matching is by package name**, not by dependency type
+
+**Example scenario:**
+
+```
+Your project
+├── dependency-a
+│   └── peerDependency: react
+│       └── peerDependency: scheduler  ← peer of peer
+└── node_modules/
+    ├── dependency-a/           ← direct dependency (always at root)
+    ├── .pnpm/
+    │   └── node_modules/
+    │       ├── react/          ← private hoisted (DEFAULT)
+    │       └── scheduler/      ← private hoisted (DEFAULT)
+    └── (react and scheduler NOT here unless public-hoist-pattern matches)
+```
+
+### Solutions: How to Hoist Peers of Peers to Root
+
+#### Option 1: `shamefully-hoist` (Hoist Everything) ⚠️
+
+**Configuration (.pnpmrc):**
+```ini
+shamefully-hoist=true
+```
+
+**Effect:**
+- Sets `public-hoist-pattern=['*']` automatically
+- **All packages** hoisted to root `node_modules/`
+- Mimics npm/yarn behavior
+- May cause version conflicts
+
+**Location:** `config/config/src/index.ts:509-529`
+
+**Result:**
+```
+node_modules/
+├── dependency-a/
+├── react/           ← NOW AT ROOT
+└── scheduler/       ← NOW AT ROOT
+```
+
+**Trade-off:** Loses pnpm's strict dependency isolation
+
+---
+
+#### Option 2: `public-hoist-pattern` (Selective Hoisting) ✅ Recommended
+
+**Configuration (.pnpmrc):**
+```ini
+public-hoist-pattern[]=react
+public-hoist-pattern[]=react-*
+public-hoist-pattern[]=scheduler
+public-hoist-pattern[]=@babel/*
+```
+
+Or in `package.json`:
+```json
+{
+  "pnpm": {
+    "publicHoistPattern": ["react", "react-*", "scheduler", "@babel/*"]
+  }
+}
+```
+
+**Effect:**
+- Only matching packages hoisted to root
+- Maintains isolation for other dependencies
+- Can use glob patterns
+
+**Result:**
+```
+node_modules/
+├── dependency-a/
+├── react/           ← Matches pattern
+├── scheduler/       ← Matches pattern
+└── .pnpm/
+    └── node_modules/
+        └── other-deps/  ← Non-matching packages stay private
+```
+
+**Trade-off:** Must explicitly list packages or patterns
+
+---
+
+#### Option 3: Workspace Root Dependencies (Implicit Hoisting)
+
+**Configuration (package.json at workspace root):**
+```json
+{
+  "dependencies": {
+    "react": "^18.0.0",
+    "scheduler": "^0.23.0"
+  }
+}
+```
+
+**Effect:**
+- Packages declared in workspace root are always at root level
+- Peers resolved from workspace root when `resolve-peers-from-workspace-root=true` (default)
+- Ensures consistent versions across workspace
+
+**Location:** `pkg-manager/resolve-dependencies/src/hoistPeers.ts:14-20`
+
+```typescript
+// TIER 1: Check workspace root dependencies by alias
+const rootDepByAlias = opts.workspaceRootDeps.find((rootDep) => rootDep.alias === peerName)
+if (rootDepByAlias?.normalizedBareSpecifier) {
+  dependencies[peerName] = rootDepByAlias.normalizedBareSpecifier  // Use root version
+}
+```
+
+**Result:**
+```
+node_modules/
+├── dependency-a/
+├── react/           ← Declared at root
+└── scheduler/       ← Declared at root
+```
+
+**Trade-off:** Must add dependencies to root package.json
+
+---
+
+### Configuration Reference
+
+| Setting | Location | Default | Effect |
+|---------|----------|---------|--------|
+| `hoist` | `.pnpmrc` | `true` | Enable/disable hoisting entirely |
+| `hoist-pattern` | `.pnpmrc` | `['*']` | Packages to hoist privately |
+| `public-hoist-pattern` | `.pnpmrc` | `[]` | Packages to hoist publicly |
+| `shamefully-hoist` | `.pnpmrc` | `false` | Shortcut for `public-hoist-pattern=['*']` |
+| `node-linker` | `.pnpmrc` | `'isolated'` | Choose linker: `isolated`, `hoisted`, or `pnp` |
+| `resolve-peers-from-workspace-root` | `.pnpmrc` | `true` | Use root deps for peer resolution |
+
+**Defaults (from `config/config/src/index.ts`):**
+```typescript
+hoist: true,                              // Line 169
+'hoist-pattern': ['*'],                   // Line 170
+'public-hoist-pattern': [],               // Line 190 - EMPTY by default!
+'resolve-peers-from-workspace-root': true, // Line 194
+```
+
+### Diagnostic Commands
+
+Check where packages are actually located:
+
+```bash
+# List all hoisted packages
+find node_modules -maxdepth 1 -type l
+
+# List privately hoisted packages
+find node_modules/.pnpm/node_modules -maxdepth 1 -type l
+
+# Check specific package location
+pnpm list react --depth=Infinity
+```
+
+### Understanding the Hoisting Decision Tree
+
+```
+Package needs to be installed
+│
+├─ Does it match public-hoist-pattern?
+│  └─ YES → Place at node_modules/{package-name}
+│
+├─ Does it match hoist-pattern?
+│  └─ YES → Place at node_modules/.pnpm/node_modules/{package-name}
+│
+└─ NO match
+   └─ Place at node_modules/.pnpm/{parent-package}/node_modules/{package-name}
+```
+
+**Important:** Peer dependencies follow the **exact same rules** as regular dependencies.
+
+### Real-World Example
+
+**Scenario:** You have `@mui/material` which has peer: `react`, and `react` has peer: `scheduler`
+
+**Without configuration:**
+```
+node_modules/
+├── @mui/
+│   └── material/
+└── .pnpm/
+    └── node_modules/
+        ├── react/       ← peer (privately hoisted)
+        └── scheduler/   ← peer of peer (privately hoisted)
+```
+
+**Problem:** `@mui/material` can't find `react` at root!
+
+**Solution 1 - Public hoist pattern:**
+```ini
+# .pnpmrc
+public-hoist-pattern[]=react
+public-hoist-pattern[]=react-*
+public-hoist-pattern[]=scheduler
+```
+
+**Result:**
+```
+node_modules/
+├── @mui/
+│   └── material/
+├── react/           ← NOW VISIBLE
+├── scheduler/       ← NOW VISIBLE
+└── .pnpm/
+    └── node_modules/
+```
+
+**Solution 2 - Workspace root deps:**
+```json
+// package.json (workspace root)
+{
+  "dependencies": {
+    "@mui/material": "^5.0.0",
+    "react": "^18.0.0",
+    "scheduler": "^0.23.0"
+  }
+}
+```
+
+**Result:**
+```
+node_modules/
+├── @mui/
+│   └── material/
+├── react/           ← Declared at root
+└── scheduler/       ← Auto-installed as peer of react
+```
+
+### Key Insights
+
+1. **hoistPeers function ≠ hoisting location** - It selects VERSION, not LOCATION
+2. **Default behavior is private hoisting** - Peers go to `.pnpm/node_modules/`
+3. **public-hoist-pattern controls root placement** - Must explicitly configure
+4. **shamefully-hoist is the nuclear option** - Hoists everything like npm/yarn
+5. **Workspace root deps get priority** - Use for consistent peer versions
+
+**Key Files:**
+- `pkg-manager/resolve-dependencies/src/hoistPeers.ts:6-44` - Version selection
+- `pkg-manager/hoist/src/index.ts:127-138` - Pattern matching
+- `pkg-manager/hoist/src/index.ts:294-302` - Location assignment
+- `config/config/src/index.ts:169-190` - Hoisting defaults
+- `config/config/src/index.ts:509-529` - shamefully-hoist handling
