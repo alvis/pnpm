@@ -635,6 +635,219 @@ Default settings that enable this behavior:
 
 If you encounter missing peer dependencies (especially peers of peers), use `pnpm i --fix-lockfile` to regenerate the lockfile with proper peer dependency resolution.
 
+---
+
+## What "Full Resolution" Actually Means
+
+### The Common Misconception
+
+**Full resolution does NOT mean ignoring the lockfile entirely.** This is a critical misunderstanding.
+
+### What Actually Happens
+
+**Full resolution means:**
+1. ✅ Re-runs the dependency resolution algorithm
+2. ✅ Checks for missing peer dependencies
+3. ✅ Re-validates version compatibility
+4. ✅ **PREFERS versions already in the lockfile**
+5. ❌ Does NOT automatically upgrade packages
+6. ❌ Does NOT ignore the lockfile
+
+### The Mechanism: Preferred Versions
+
+**Location:** `lockfile/preferred-versions/src/index.ts:29-38`
+
+```typescript
+function addPreferredVersionsFromLockfile(snapshots: PackageSnapshots, preferredVersions: PreferredVersions): void {
+  for (const [depPath, snapshot] of Object.entries(snapshots)) {
+    const { name, version } = nameVerFromPkgSnapshot(depPath, snapshot)
+    if (!preferredVersions[name]) {
+      preferredVersions[name] = { [version]: 'version' }  // Lockfile versions are preferred!
+    } else if (!preferredVersions[name][version]) {
+      preferredVersions[name][version] = 'version'
+    }
+  }
+}
+```
+
+**During resolution:**
+1. pnpm extracts all versions currently in the lockfile
+2. These become "preferred versions" passed to the resolver
+3. When picking a version, **lockfile versions are tried first**
+4. Only if no lockfile version satisfies the range, a new version is selected
+
+### Version Selection Priority
+
+**Location:** `resolving/npm-resolver/src/pickPackageFromMeta.ts:147-182`
+
+```typescript
+export function pickVersionByVersionRange({ meta, versionRange, preferredVersionSelectors }) {
+  // PRIORITY 1: Try preferred versions first (from lockfile)
+  if (preferredVersionSelectors != null && Object.keys(preferredVersionSelectors).length > 0) {
+    const prioritizedPreferredVersions = prioritizePreferredVersions(meta, versionRange, preferredVersionSelectors)
+    for (const preferredVersions of prioritizedPreferredVersions) {
+      // Try to pick a version already in lockfile that satisfies the range
+      const preferredVersion = semver.maxSatisfying(preferredVersions, versionRange, true)
+      if (preferredVersion) {
+        return preferredVersion  // Use existing lockfile version!
+      }
+    }
+  }
+
+  // PRIORITY 2: Only if no preferred version satisfies, pick latest
+  const latest = meta['dist-tags'].latest
+  if (latest && semverSatisfiesLoose(latest, versionRange)) {
+    return latest
+  }
+
+  // PRIORITY 3: Fallback to max satisfying version
+  return semver.maxSatisfying(Object.keys(meta.versions), versionRange, true)
+}
+```
+
+### The `proceed` Flag
+
+**Location:** `pkg-manager/resolve-dependencies/src/resolveDependencies.ts:1065-1124`
+
+```typescript
+function getDepsToResolve(wantedDependencies, wantedLockfile, options) {
+  let proceedAll = options.proceed  // forceFullResolution sets this to true
+
+  for (const wantedDependency of wantedDependencies) {
+    let proceed = proceedAll
+
+    // Check if existing lockfile version satisfies the requirement
+    if (resolvedDependencies[wantedDependency.alias] &&
+        satisfiesWanted(resolvedDependencies[wantedDependency.alias])) {
+      reference = resolvedDependencies[wantedDependency.alias]  // Use lockfile version
+    } else if (
+      // If dependencies that were used by the previous version of the package
+      // satisfy the newer version's requirements, then pnpm tries to keep
+      // the previous dependency.
+      semver.validRange(wantedDependency.bareSpecifier) !== null &&
+      preferredDependencies[wantedDependency.alias] &&
+      satisfiesWanted(preferredDependencies[wantedDependency.alias])
+    ) {
+      proceed = true
+      reference = preferredDependencies[wantedDependency.alias]  // Prefer old version
+    }
+
+    // ...
+  }
+}
+```
+
+**Key comment from the code:**
+> "If dependencies that were used by the previous version of the package satisfy the newer version's requirements, then pnpm tries to keep the previous dependency."
+
+### Comparison: Frozen vs Full Resolution
+
+| Aspect | Frozen Install | Full Resolution |
+|--------|----------------|-----------------|
+| **Dependency resolution** | ❌ Skipped entirely | ✅ Re-runs algorithm |
+| **Lockfile respected** | ✅ Used as-is (100% trust) | ✅ Used as preference (verified) |
+| **Peer dependency check** | ❌ Skipped | ✅ Runs hoistPeers loop |
+| **Version validation** | ❌ Skipped | ✅ Verifies version compatibility |
+| **Package updates** | ❌ No | ❌ No (unless ranges changed) |
+| **Preferred versions** | N/A | ✅ Lockfile versions prioritized |
+| **Speed** | ⚡ Very fast | 🐌 Slower (network/validation) |
+
+### When Packages Actually Get Updated
+
+Packages will ONLY get new versions if:
+
+1. **You explicitly request it:**
+   ```bash
+   pnpm update          # Updates all packages within their ranges
+   pnpm update react    # Updates specific package
+   pnpm install react@18  # Explicitly request new version
+   ```
+
+2. **The version range changed:**
+   ```json
+   // Before: "react": "^17.0.0" → lockfile has react@17.0.2
+   // After:  "react": "^18.0.0" → lockfile version doesn't satisfy new range
+   // Result: Resolves to react@18.x.x
+   ```
+
+3. **No existing version satisfies the range:**
+   ```bash
+   # New dependency added
+   pnpm add new-package
+   # No preferred version exists, picks latest satisfying version
+   ```
+
+### What `--fix-lockfile` Actually Does
+
+**It does NOT upgrade packages.** It:
+
+1. **Forces full resolution** (re-validates everything)
+2. **Strips certain lockfile fields** (forces recalculation):
+   ```typescript
+   // pkg-manager/core/src/install/index.ts:1100-1112
+   ctx.wantedLockfile.packages = mapValues(({ dependencies, optionalDependencies, resolution }) => ({
+     dependencies,         // Keep deps
+     optionalDependencies, // Keep optional deps
+     resolution,           // Keep resolution info
+     // REMOVES: peerDependencies, transitivePeerDependencies, etc.
+     // These will be recalculated
+   }), ctx.wantedLockfile.packages)
+   ```
+3. **Re-resolves peer dependencies** (what you want!)
+4. **Uses preferred versions** (lockfile versions stay the same)
+5. **Regenerates peer suffix hashes** (fixes broken paths)
+
+### Example Scenario
+
+**Before `pnpm install --fix-lockfile`:**
+```yaml
+# pnpm-lock.yaml
+snapshots:
+  ajv-keywords@1.5.0:
+    dependencies: {}
+    # Missing peer dependency info!
+```
+
+**After `pnpm install --fix-lockfile`:**
+```yaml
+# pnpm-lock.yaml
+snapshots:
+  ajv-keywords@1.5.0(ajv@4.10.4):
+    peerDependencies:
+      ajv: ^4.10.0
+    peerDependenciesMeta:
+      ajv:
+        optional: false
+    # ajv@4.10.4 was already in lockfile, so it stays!
+```
+
+**Key point:** `ajv@4.10.4` was already in the lockfile and stays at that version. Only the peer relationship is regenerated.
+
+### Summary
+
+**"Full resolution" = "Re-run resolution algorithm while preferring existing lockfile versions"**
+
+It's NOT:
+- Ignoring the lockfile
+- Upgrading all packages
+- Like `npm install` from scratch
+
+It IS:
+- Re-validating that everything is correct
+- Filling in missing peer information
+- Fixing broken lockfile entries
+- **While preserving existing versions**
+
+This is why `pnpm install --fix-lockfile` is safe to run - it fixes issues without changing your dependency versions (unless they no longer satisfy their ranges).
+
+**Key Files:**
+- `lockfile/preferred-versions/src/index.ts:29-38` - Extracting preferred versions from lockfile
+- `resolving/npm-resolver/src/pickPackageFromMeta.ts:147-182` - Version selection algorithm
+- `pkg-manager/resolve-dependencies/src/resolveDependencies.ts:1065-1124` - getDepsToResolve with proceed flag
+- `pkg-manager/core/src/install/index.ts:1100-1112` - Lockfile field stripping
+
+---
+
 **Key Files:**
 - `pkg-manager/plugin-commands-installation/src/install.ts:82` - Flag definition
 - `pkg-manager/core/src/install/index.ts:430` - Forces full resolution
