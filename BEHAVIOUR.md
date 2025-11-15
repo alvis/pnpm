@@ -642,3 +642,241 @@ If you encounter missing peer dependencies (especially peers of peers), use `pnp
 - `pkg-manager/core/src/install/index.ts:1100-1112` - Strips lockfile fields
 - `pkg-manager/resolve-dependencies/src/resolveDependencies.ts:341-387` - Peers of peers loop
 - `pkg-manager/resolve-dependencies/src/resolvePeers.ts:183-191` - Deduplication
+
+---
+
+## What Else Can Trigger the hoistPeers Loop?
+
+The `hoistPeers` loop (which handles peers of peers) can be triggered in multiple ways beyond `--fix-lockfile`. Understanding these triggers is crucial for managing peer dependency resolution.
+
+### hoistPeers Flag Activation
+
+**Location:** `pkg-manager/resolve-dependencies/src/resolveDependencyTree.ts:201`
+
+```typescript
+hoistPeers: autoInstallPeers || opts.dedupePeerDependents,
+```
+
+The `hoistPeers` flag is enabled when **either** condition is true:
+1. `autoInstallPeers` is `true`
+2. `dedupePeerDependents` is `true`
+
+### Direct Triggers (Enable hoistPeers Immediately)
+
+#### 1. **`autoInstallPeers` Setting (Default: `true`)**
+
+**Default Value:** `true` (`pkg-manager/core/src/install/extendInstallOptions.ts:188`)
+
+**Configuration:**
+- `.pnpmrc` file: `auto-install-peers=true`
+- `package.json` > `pnpm` field: `{ "pnpm": { "autoInstallPeers": true } }`
+- Environment variable: `npm_config_auto_install_peers=true`
+
+**Behavior:**
+- Automatically installs missing peer dependencies as `devDependencies`
+- Enables the hoistPeers loop to resolve transitive peer dependencies
+- **This is enabled by default**, so hoistPeers runs by default in full resolution mode
+
+**Example:**
+```bash
+# Explicitly enable (already default)
+pnpm install --auto-install-peers
+
+# Disable auto-install-peers
+pnpm install --auto-install-peers=false
+```
+
+**Documentation:** `config/config/CHANGELOG.md` mentions:
+> "New setting supported: `auto-install-peers`. When it is set to `true`, `pnpm add <pkg>` automatically installs any missing peer dependencies as `devDependencies`."
+
+#### 2. **`dedupePeerDependents` Setting**
+
+**Purpose:**
+- Deduplicates packages that have different peer dependency sets
+- Also **forces full resolution** (see `pkg-manager/core/src/install/index.ts:1096`)
+
+**Configuration:**
+- Workspace-level setting in `pnpm-workspace.yaml`
+- Used primarily in monorepos
+
+**Behavior:**
+- Enables hoistPeers
+- Forces `needsFullResolution = true`
+- Prevents frozen install
+
+### Indirect Triggers (Force Full Resolution)
+
+These conditions force full resolution, which then runs the hoistPeers loop (if `autoInstallPeers` or `dedupePeerDependents` is true):
+
+#### 3. **CLI Flags**
+
+**Location:** `pkg-manager/core/src/install/index.ts:1091-1096`
+
+```typescript
+const forceFullResolution = ctx.wantedLockfile.lockfileVersion !== LOCKFILE_VERSION ||
+  !opts.currentLockfileIsUpToDate ||
+  opts.force ||
+  opts.needsFullResolution ||
+  ctx.lockfileHadConflicts ||
+  opts.dedupePeerDependents
+```
+
+| Flag | Description | File Location |
+|------|-------------|---------------|
+| `--fix-lockfile` | Repairs broken lockfile entries | `plugin-commands-installation/src/install.ts:82` |
+| `--force` | Reinstalls all dependencies, ignoring cache | `core/src/install/index.ts:1093` |
+| `--resolution-only` | Re-runs resolution without installing (for debugging) | `plugin-commands-installation/src/install.ts:83` |
+
+**Example:**
+```bash
+# Force full resolution and reinstall everything
+pnpm install --force
+
+# Only re-run resolution (no download/linking)
+pnpm install --resolution-only
+```
+
+#### 4. **Lockfile Version Mismatch**
+
+**Location:** `pkg-manager/core/src/install/index.ts:428-432`
+
+```typescript
+const upToDateLockfileMajorVersion = ctx.wantedLockfile.lockfileVersion.toString().startsWith(`${LOCKFILE_MAJOR_VERSION}.`)
+let needsFullResolution = outdatedLockfileSettings ||
+  opts.fixLockfile ||
+  !upToDateLockfileMajorVersion ||  // Lockfile major version mismatch
+  opts.forceFullResolution
+```
+
+**When it triggers:**
+- When the lockfile was created with an older major version of pnpm
+- Example: lockfile has `lockfileVersion: '6.0'` but current pnpm uses `lockfileVersion: '7.0'`
+
+**Behavior:**
+- Automatically triggers full resolution
+- No manual intervention required
+- Ensures lockfile compatibility
+
+#### 5. **Lockfile Merge Conflicts**
+
+**Location:** `pkg-manager/core/src/install/index.ts:1095`
+
+```typescript
+ctx.lockfileHadConflicts
+```
+
+**When it triggers:**
+- After a git merge where `pnpm-lock.yaml` had conflicts
+- pnpm automatically detects conflict markers in the lockfile
+
+**Behavior:**
+- Forces full resolution to regenerate a clean lockfile
+- Resolves conflicts automatically
+
+#### 6. **Outdated Lockfile Settings**
+
+**Location:** `lockfile/settings-checker/src/getOutdatedLockfileSetting.ts:39-69`
+
+When **any** of these 9 settings differ from the current configuration, it triggers full resolution:
+
+| Setting | Description | Line |
+|---------|-------------|------|
+| `overrides` | Dependency version overrides | 39-40 |
+| `packageExtensionsChecksum` | Package.json extensions checksum | 42-43 |
+| `ignoredOptionalDependencies` | Optional deps to skip | 45-46 |
+| `patchedDependencies` | Patched package definitions | 48-49 |
+| `settings.autoInstallPeers` | Auto-install peers setting | 51-52 |
+| `settings.excludeLinksFromLockfile` | Exclude symlinks from lockfile | 54-55 |
+| `settings.peersSuffixMaxLength` | Max length for peer suffix | 57-61 |
+| `pnpmfileChecksum` | .pnpmfile.cjs checksum | 63-64 |
+| `settings.injectWorkspacePackages` | Inject workspace packages | 66-67 |
+
+**Example scenario:**
+```yaml
+# .pnpmrc changes from:
+auto-install-peers=false
+
+# to:
+auto-install-peers=true
+
+# Next `pnpm install` triggers full resolution because
+# lockfile.settings.autoInstallPeers doesn't match current config
+```
+
+**Code:**
+```typescript
+if ((lockfile.settings?.autoInstallPeers != null && lockfile.settings.autoInstallPeers !== autoInstallPeers)) {
+  return 'settings.autoInstallPeers'
+}
+```
+
+#### 7. **`dedupePeerDependents` Configuration**
+
+**Location:** `pkg-manager/core/src/install/index.ts:1096`
+
+When `dedupePeerDependents` is set to `true`:
+- Forces `forceFullResolution = true`
+- Enables `hoistPeers`
+- Deduplicates packages with different peer combinations
+
+**Configuration:**
+- Default: Can be enabled in workspace configuration
+- Used in monorepos to reduce duplication
+
+### Full Resolution Decision Tree
+
+```
+Can frozen install be used?
+│
+├─ NO (any of the following):
+│  ├─ opts.fixLockfile === true
+│  ├─ opts.force === true
+│  ├─ opts.needsFullResolution === true
+│  ├─ lockfile version mismatch
+│  ├─ outdatedLockfileSettings !== null
+│  ├─ lockfileHadConflicts === true
+│  ├─ dedupePeerDependents === true
+│  └─ → RUN FULL RESOLUTION
+│       │
+│       └─ hoistPeers enabled?
+│          ├─ autoInstallPeers === true (default)
+│          ├─ OR dedupePeerDependents === true
+│          └─ → RUN HOISTPEERS LOOP (handles peers of peers)
+│
+└─ YES:
+   └─ → USE FROZEN INSTALL (skip hoistPeers loop)
+```
+
+### Summary Table
+
+| Trigger | Type | Default | How to Enable | Enables hoistPeers? |
+|---------|------|---------|---------------|---------------------|
+| `autoInstallPeers` | Config | `true` | `.pnpmrc` or CLI flag | ✅ Direct |
+| `dedupePeerDependents` | Config | `false` | Workspace config | ✅ Direct |
+| `--fix-lockfile` | CLI Flag | N/A | `pnpm i --fix-lockfile` | ✅ Via full resolution |
+| `--force` | CLI Flag | N/A | `pnpm i --force` | ✅ Via full resolution |
+| `--resolution-only` | CLI Flag | N/A | `pnpm i --resolution-only` | ✅ Via full resolution |
+| Lockfile version mismatch | Auto | N/A | Upgrade pnpm version | ✅ Via full resolution |
+| Lockfile had conflicts | Auto | N/A | Git merge conflicts | ✅ Via full resolution |
+| Changed `overrides` | Auto | N/A | Modify `.pnpmrc` overrides | ✅ Via full resolution |
+| Changed `patchedDependencies` | Auto | N/A | Add/remove patches | ✅ Via full resolution |
+| Changed `packageExtensions` | Auto | N/A | Modify extensions | ✅ Via full resolution |
+| Changed `autoInstallPeers` | Auto | N/A | Toggle setting in config | ✅ Via full resolution |
+
+### Recommendation
+
+**To ensure peers of peers are installed:**
+
+1. **Use the default settings** - `autoInstallPeers` is `true` by default, which enables hoistPeers
+2. **Force full resolution when needed:**
+   - `pnpm install --fix-lockfile` - Best for fixing existing issues
+   - `pnpm install --force` - Nuclear option, reinstalls everything
+3. **Be aware of frozen installs** - When lockfile is up-to-date, pnpm skips resolution to be fast
+4. **Understand configuration changes** - Changing any of the 9 lockfile settings will trigger full resolution
+
+**Key Files:**
+- `pkg-manager/resolve-dependencies/src/resolveDependencyTree.ts:201` - hoistPeers flag
+- `pkg-manager/core/src/install/extendInstallOptions.ts:188` - autoInstallPeers default
+- `pkg-manager/core/src/install/index.ts:1091-1096` - forceFullResolution logic
+- `lockfile/settings-checker/src/getOutdatedLockfileSetting.ts:39-69` - Outdated setting checks
+- `config/config/src/index.ts:136` - auto-install-peers config
